@@ -1,0 +1,184 @@
+#
+# FILE            iotaisoxml_mics.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# Write-back to the MICS (channelDirection both): a client's write to a mapped attribute is task data POSTed to
+# mics.url - the element of the DataChannel's tag, its id (A) the entity's @deviceId, its attributes and child
+# elements the columns written - an array of objects, or one object (NGSI-LD compacts an array of one). A
+# write that is neither an attribute nor elements (an array of strings) is refused: 400. A MICS that
+# refuses the task data is logged - the write was stored.
+#
+# Elements no DataChannel takes are iotagent-isoxml's errors: one element alone its DEVICE_NOT_FOUND (404),
+# none taken 400, some 202 - the errors in an array.
+#
+# REQUIRE_FEATURE: CHANNEL_WRITE_BACK
+#
+--NAME--
+iotaisoxml - written attributes as task data POSTed to the MICS; elements no DataChannel takes
+
+--TAGS--
+iotaisoxml
+
+--INIT--
+rm -rf "${ISOXML_TEST_DIR:?}"
+mkdir -p "$ISOXML_TEST_DIR"
+cat > "$ISOXML_TEST_DIR/bridges.json" <<EOF
+{
+  "iotaisoxml": {
+    "southbound": { "port": $ISOXML_SOUTH_PORT },
+    "mics": { "url": "http://localhost:$ISOXML_MICS_PORT/taskdata" },
+    "ngsild": {
+      "defaultEntity": false,
+      "dataChannels": {
+        "TSK": { "channelDirection": "both", "idEncoding": "percent",
+                 "entities": [ { "type": "Task", "id": "urn:ngsi-ld:Task:{@deviceId}",
+                                 "attributes": { "name": { "column": "B" }, "status": { "column": "G" },
+                                                 "worker": { "column": "F" }, "allocations": { "column": "PAN" } } } ] }
+      }
+    }
+  }
+}
+EOF
+micsStart
+brokerStart
+
+--RUN--
+echo "01. A task with two allocations (PAN), and a customer no DataChannel takes - 202, the customer's error"
+echo "======================================================================================================"
+taskPost '<ISO11783_TaskData><TSK A="TSK11" B="filling" G="1" F="WKR1"><PAN A="PDT1" C="10"/><PAN A="PDT2" C="20"/></TSK><CTR A="CTR1" B="Napoleon"/></ISO11783_TaskData>'
+entityAwait urn:ngsi-ld:Task:TSK11 '"status"'
+entityGet urn:ngsi-ld:Task:TSK11 keyValues
+echo
+echo
+
+
+echo "02. A customer alone - its error, 404; two of them - 400, both"
+echo "=============================================================="
+taskPost '<ISO11783_TaskData><CTR A="CTR1"/></ISO11783_TaskData>'
+taskPost '<ISO11783_TaskData><CTR A="CTR1"/><CTR A="CTR2"/></ISO11783_TaskData>'
+echo
+echo
+
+
+echo "03. PATCH status 4 - the task's G POSTed to the MICS, application/xml"
+echo "====================================================================="
+attrPatch urn:ngsi-ld:Task:TSK11 status '"4"'
+micsAwait 1
+echo
+echo
+
+
+echo "04. PATCH name - escaped: & and quotes; a number an attribute's text"
+echo "===================================================================="
+attrPatch urn:ngsi-ld:Task:TSK11 name '"Smith & \"Sons\""'
+attrPatch urn:ngsi-ld:Task:TSK11 worker 42
+micsAwait 2
+echo
+echo
+
+
+echo "05. PATCH allocations - an array of objects: child elements"
+echo "==========================================================="
+attrPatch urn:ngsi-ld:Task:TSK11 allocations '[{"A": "PDT250", "C": "50000", "ASP": [{"A": "2020-02-05T13:00:00", "D": "1"}]}, {"A": "PDT251", "C": "100"}]'
+micsAwait 1
+echo
+echo
+
+
+echo "06. PATCH worker an array of strings - no ISOXML attribute nor element: 400, nothing sent; the MICS refusing - logged, stored"
+echo "==========================================================================================================================="
+attrPatch urn:ngsi-ld:Task:TSK11 worker '["WKR1", "WKR2"]'
+attrPatch urn:ngsi-ld:Task:TSK11 name '"REFUSE"'
+micsAwait 1
+entityGet urn:ngsi-ld:Task:TSK11 keyValues
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+micsStop
+
+
+--EXPECT--
+01. A task with two allocations (PAN), and a customer no DataChannel takes - 202, the customer's error
+======================================================================================================
+202
+[{"name":"DEVICE_NOT_FOUND","message":"Device not found with ID [CTR1]"}]
+{
+  "allocations": [
+    {
+      "A": "PDT1",
+      "C": "10"
+    },
+    {
+      "A": "PDT2",
+      "C": "20"
+    }
+  ],
+  "id": "urn:ngsi-ld:Task:TSK11",
+  "name": "filling",
+  "status": "1",
+  "type": "Task",
+  "worker": "WKR1"
+}
+
+
+02. A customer alone - its error, 404; two of them - 400, both
+==============================================================
+404
+{"name":"DEVICE_NOT_FOUND","message":"Device not found with ID [CTR1]"}
+400
+[{"name":"DEVICE_NOT_FOUND","message":"Device not found with ID [CTR1]"},{"name":"DEVICE_NOT_FOUND","message":"Device not found with ID [CTR2]"}]
+
+
+03. PATCH status 4 - the task's G POSTed to the MICS, application/xml
+=====================================================================
+PATCH status: 204
+POST /taskdata application/xml <?xml version="1.0" encoding="UTF-8"?>\n<ISO11783_TaskData VersionMajor="4" VersionMinor="3" DataTransferOrigin="1"><TSK A="TSK11" G="4"/></ISO11783_TaskData>\n
+
+
+04. PATCH name - escaped: & and quotes; a number an attribute's text
+====================================================================
+PATCH name: 204
+PATCH worker: 204
+POST /taskdata application/xml <?xml version="1.0" encoding="UTF-8"?>\n<ISO11783_TaskData VersionMajor="4" VersionMinor="3" DataTransferOrigin="1"><TSK A="TSK11" B="Smith &amp; &quot;Sons&quot;"/></ISO11783_TaskData>\n
+POST /taskdata application/xml <?xml version="1.0" encoding="UTF-8"?>\n<ISO11783_TaskData VersionMajor="4" VersionMinor="3" DataTransferOrigin="1"><TSK A="TSK11" F="42"/></ISO11783_TaskData>\n
+
+
+05. PATCH allocations - an array of objects: child elements
+===========================================================
+PATCH allocations: 204
+POST /taskdata application/xml <?xml version="1.0" encoding="UTF-8"?>\n<ISO11783_TaskData VersionMajor="4" VersionMinor="3" DataTransferOrigin="1"><TSK A="TSK11"><PAN A="PDT250" C="50000"><ASP A="2020-02-05T13:00:00" D="1"/></PAN><PAN A="PDT251" C="100"/></TSK></ISO11783_TaskData>\n
+
+
+06. PATCH worker an array of strings - no ISOXML attribute nor element: 400, nothing sent; the MICS refusing - logged, stored
+===========================================================================================================================
+PATCH worker: 400
+PATCH name: 204
+POST /taskdata application/xml <?xml version="1.0" encoding="UTF-8"?>\n<ISO11783_TaskData VersionMajor="4" VersionMinor="3" DataTransferOrigin="1"><TSK A="TSK11" B="REFUSE"/></ISO11783_TaskData>\n
+{
+  "allocations": [
+    {
+      "A": "PDT250",
+      "ASP": {
+        "A": "2020-02-05T13:00:00",
+        "D": "1"
+      },
+      "C": "50000"
+    },
+    {
+      "A": "PDT251",
+      "C": "100"
+    }
+  ],
+  "id": "urn:ngsi-ld:Task:TSK11",
+  "name": "REFUSE",
+  "status": "4",
+  "type": "Task",
+  "worker": 42
+}
+
+

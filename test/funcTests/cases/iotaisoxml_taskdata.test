@@ -1,0 +1,208 @@
+#
+# FILE            iotaisoxml_taskdata.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# Task data POSTed by the MICS - iotagent-isoxml's user manual example: a farm, a customer, a task with a
+# product allocation at a time, product groups, products, a value presentation. Each element under
+# ISO11783_TaskData is a record on the DataChannel of its tag:
+#
+#   CTR   a Person: B familyName, C givenName (iotagent-isoxml's names)
+#   FRM   a Farm, its customer (I) a Relationship-like id
+#   TSK   a Task - its product allocations (PAN, each with its ASP) an array: one PAN, the array of one
+#         compacted to its item, as NGSI-LD has it
+#   *     every other element: an IsoxmlElement, its tag (@element) and name (B)
+#
+# The errors are iotagent-isoxml's: an element without its id (A) 400 MANDATORY_PARAMS_NOT_FOUND, XML that is
+# not task data 400 PARSE_ERROR, a body that is not XML 400 UNSUPPORTED_TYPE.
+#
+--NAME--
+iotaisoxml - TASKDATA.XML from the MICS, each element a DataChannel record by its tag
+
+--TAGS--
+iotaisoxml
+
+--INIT--
+rm -rf "${ISOXML_TEST_DIR:?}"
+mkdir -p "$ISOXML_TEST_DIR"
+cat > "$ISOXML_TEST_DIR/bridges.json" <<EOF
+{
+  "iotaisoxml": {
+    "southbound": { "port": $ISOXML_SOUTH_PORT },
+    "ngsild": {
+      "defaultEntity": false,
+      "dataChannels": {
+        "CTR": { "entities": [ { "type": "Person", "id": "urn:ngsi-ld:Person:{@deviceId}",
+                                 "attributes": { "familyName": { "column": "B" }, "givenName": { "column": "C" } } } ] },
+        "FRM": { "entities": [ { "type": "Farm", "id": "urn:ngsi-ld:Farm:{@deviceId}",
+                                 "attributes": { "name": { "column": "B" }, "city": { "column": "F" }, "customer": { "column": "I" } } } ] },
+        "TSK": { "entities": [ { "type": "Task", "id": "urn:ngsi-ld:Task:{@deviceId}",
+                                 "attributes": { "name": { "column": "B" }, "allocations": { "column": "PAN" } } } ] },
+        "*":   { "entities": [ { "type": "IsoxmlElement", "id": "urn:ngsi-ld:IsoxmlElement:{@deviceId}",
+                                 "attributes": { "element": { "column": "@element" }, "name": { "column": "B" } } } ] }
+      }
+    }
+  }
+}
+EOF
+brokerStart
+
+--RUN--
+echo "01. The user manual's task data - 200, no body"
+echo "=============================================="
+taskPost '<?xml version="1.0" encoding="utf-8" ?>
+<ISO11783_TaskData>
+    <FRM A="FRM3" B="Animal Farm" C="Street2" D="PO Box2" E="PostalCode2" F="City2" G="State2" H="Country2" I="CTR2"/>
+    <CTR A="CTR2" B="Napoleon the Pig" />
+    <TSK A="TSK11" B="mass-based product allocation">
+        <PAN A="PDT2" B="004B" C="20000" D="1" E="DET3" F="VPN1">
+            <ASP A="2019-11-12T08:00:00" D="4"/>
+        </PAN>
+    </TSK>
+    <PGP A="PGP1" B="Herbicides"/>
+    <PDT A="PDT1" B="agent 1" C="PGP1"/>
+    <PGP A="PGP2" B="Potato" C="2" />
+    <PDT A="PDT2" B="Asterix" C="PGP2"/>
+    <VPN A="VPN1" B="0.001" C="1.0" D="0" E="kg"/>
+</ISO11783_TaskData>'
+entityAwait urn:ngsi-ld:IsoxmlElement:VPN1 '"element"'
+echo
+echo
+
+
+echo "02. The customer, the farm, the task - its one PAN element its allocations (an array of one, compacted)"
+echo "======================================================================================================="
+entityGet urn:ngsi-ld:Person:CTR2 keyValues
+entityGet urn:ngsi-ld:Farm:FRM3 keyValues
+entityGet urn:ngsi-ld:Task:TSK11 keyValues
+echo
+echo
+
+
+echo "03. The other elements - on the * DataChannel, their tag and name"
+echo "================================================================="
+curl -s "localhost:$ISOXML_PORT/ngsi-ld/v1/entities?type=IsoxmlElement&options=keyValues" | python3 -c '
+import json, sys
+for e in sorted(json.load(sys.stdin), key=lambda e: e["id"]):
+    print(e["id"], e["element"], e["name"])'
+echo
+echo
+
+
+echo "04. Entities, comments, a DOCTYPE - &amp; &quot; &#233; in a value"
+echo "=================================================================="
+taskPost '<?xml version="1.0"?><!DOCTYPE ISO11783_TaskData><!-- from the MICS -->
+<ISO11783_TaskData VersionMajor="4" VersionMinor="3"><CTR A="CTR7" B="Smith &amp; Sons &quot;Ltd&quot;" C="Ren&#233;"/></ISO11783_TaskData>'
+entityAwait urn:ngsi-ld:Person:CTR7 '"givenName"'
+entityGet urn:ngsi-ld:Person:CTR7 keyValues
+echo
+echo
+
+
+echo "05. An element without its id (A) - 400 MANDATORY_PARAMS_NOT_FOUND, nothing taken"
+echo "=================================================================================="
+taskPost '<ISO11783_TaskData><CTR A="CTR8" B="Jones"/><FRM B="no id"/></ISO11783_TaskData>'
+curl -s -o /dev/null -w "CTR8: %{http_code}\n" "localhost:$ISOXML_PORT/ngsi-ld/v1/entities/urn:ngsi-ld:Person:CTR8"
+echo
+echo
+
+
+echo "06. Not task data - 400 PARSE_ERROR; not XML - 400 UNSUPPORTED_TYPE; a GET 405, another path 404"
+echo "================================================================================================="
+taskPost '<ISO11783_TaskData><CTR A="CTR9"></ISO11783_TaskData>'
+taskPost '<TASKDATA><CTR A="CTR9"/></TASKDATA>'
+taskPost '<ISO11783_TaskData><CTR A="CTR9" B="a &nbsp; b"/></ISO11783_TaskData>'
+taskPost '{"CTR": {"A": "CTR9"}}' application/json
+curl -s -w "\n%{http_code}\n" "localhost:$ISOXML_SOUTH_PORT/iot/isoxml" | sed '/^$/d'
+curl -s -w "\n%{http_code}\n" -X POST "localhost:$ISOXML_SOUTH_PORT/iot/other" -H 'Content-Type: application/xml' -d '<a/>' | sed '/^$/d'
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+
+
+--EXPECT--
+01. The user manual's task data - 200, no body
+==============================================
+200
+
+
+02. The customer, the farm, the task - its one PAN element its allocations (an array of one, compacted)
+=======================================================================================================
+{
+  "familyName": "Napoleon the Pig",
+  "id": "urn:ngsi-ld:Person:CTR2",
+  "type": "Person"
+}
+{
+  "city": "City2",
+  "customer": "CTR2",
+  "id": "urn:ngsi-ld:Farm:FRM3",
+  "name": "Animal Farm",
+  "type": "Farm"
+}
+{
+  "allocations": {
+    "A": "PDT2",
+    "ASP": {
+      "A": "2019-11-12T08:00:00",
+      "D": "4"
+    },
+    "B": "004B",
+    "C": "20000",
+    "D": "1",
+    "E": "DET3",
+    "F": "VPN1"
+  },
+  "id": "urn:ngsi-ld:Task:TSK11",
+  "name": "mass-based product allocation",
+  "type": "Task"
+}
+
+
+03. The other elements - on the * DataChannel, their tag and name
+=================================================================
+urn:ngsi-ld:IsoxmlElement:PDT1 PDT agent 1
+urn:ngsi-ld:IsoxmlElement:PDT2 PDT Asterix
+urn:ngsi-ld:IsoxmlElement:PGP1 PGP Herbicides
+urn:ngsi-ld:IsoxmlElement:PGP2 PGP Potato
+urn:ngsi-ld:IsoxmlElement:VPN1 VPN 0.001
+
+
+04. Entities, comments, a DOCTYPE - &amp; &quot; &#233; in a value
+==================================================================
+200
+{
+  "familyName": "Smith & Sons \"Ltd\"",
+  "givenName": "Ren\u00e9",
+  "id": "urn:ngsi-ld:Person:CTR7",
+  "type": "Person"
+}
+
+
+05. An element without its id (A) - 400 MANDATORY_PARAMS_NOT_FOUND, nothing taken
+==================================================================================
+400
+{"name":"MANDATORY_PARAMS_NOT_FOUND","message":"Some of the mandatory params weren't found in the request: [\"Id for Entity: frm\"]"}
+CTR8: 404
+
+
+06. Not task data - 400 PARSE_ERROR; not XML - 400 UNSUPPORTED_TYPE; a GET 405, another path 404
+=================================================================================================
+400
+{"name":"PARSE_ERROR","message":"There was a syntax error in the ISOXML request: an end tag that does not match its start tag"}
+400
+{"name":"PARSE_ERROR","message":"There was a syntax error in the ISOXML request: the root element is TASKDATA, not ISO11783_TaskData"}
+400
+{"name":"PARSE_ERROR","message":"There was a syntax error in the ISOXML request: element CTR, attribute B: a '<' or a reference that is not known"}
+400
+{"name":"UNSUPPORTED_TYPE","message":"The request content didn't have the expected type [application/xml ]"}
+{"name":"METHOD_NOT_ALLOWED","message":"task data is POSTed"}
+405
+{"name":"NOT_FOUND","message":"task data is POSTed to the agent's resource"}
+404
+
+
